@@ -1,33 +1,35 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Search, RefreshCw, ArrowUp, ArrowDown, X, TrendingUp, TrendingDown } from "lucide-react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { Search, RefreshCw, ArrowUp, ArrowDown, X, TrendingUp, TrendingDown, Loader2 } from "lucide-react";
 
 // ============================================================= //
-// DATOS DE MUESTRA
-// Misma estructura que produce el script Python (fetch_watchlist).
-// Para conectar datos reales: reemplazar esta constante por un
-// fetch() a un endpoint propio (Flask/FastAPI) que exponga el
-// mismo JSON, dado que yfinance no puede llamarse desde el
-// navegador (sin CORS, es una librería de Python).
+// TICKERS A CONSULTAR
+// Antes esto era un array de objetos hardcodeado (RAW_DATA).
+// Ahora solo guardamos la lista de tickers y el resto de los
+// datos (open/high/low/close/prevClose) se pide en vivo a la
+// API de Yahoo Finance (endpoint "chart").
 // ============================================================= //
-const RAW_DATA = [
-  { ticker: "GGAL", open: 32.4, high: 34.9, low: 32.0, close: 34.5, prevClose: 32.1 },
-  { ticker: "BMA", open: 45.5, high: 53.2, low: 44.8, close: 52.8, prevClose: 45.0 },
-  { ticker: "YPF", open: 40.0, high: 41.2, low: 38.7, close: 39.1, prevClose: 40.1 },
-  { ticker: "MELI", open: 2060, high: 2085, low: 2040, close: 2078, prevClose: 2050 },
-  { ticker: "SUPV", open: 6.35, high: 6.5, low: 6.1, close: 6.15, prevClose: 6.4 },
-  { ticker: "CEPU", open: 11.0, high: 11.1, low: 9.7, close: 9.85, prevClose: 11.2 },
-  { ticker: "PAM", open: 29.4, high: 32.1, low: 29.1, close: 31.8, prevClose: 29.0 },
-  { ticker: "TGS", open: 21.6, high: 22.0, low: 21.3, close: 21.85, prevClose: 21.5 },
-  { ticker: "CRESY", open: 12.35, high: 12.55, low: 12.1, close: 12.42, prevClose: 12.3 },
-  { ticker: "BIOX", open: 4.15, high: 4.6, low: 4.1, close: 4.55, prevClose: 4.1 },
-  { ticker: "EDN", open: 20.0, high: 22.1, low: 19.9, close: 21.9, prevClose: 19.8 },
-  { ticker: "IRS", open: 10.7, high: 11.6, low: 10.6, close: 11.5, prevClose: 10.6 },
-  { ticker: "LOMA", open: 9.1, high: 10.2, low: 9.0, close: 10.1, prevClose: 9.0 },
-  { ticker: "TEO", open: 10.5, high: 10.7, low: 8.9, close: 9.0, prevClose: 10.6 },
+const TICKERS = [
+  "GGAL", "BMA", "YPF", "MELI", "SUPV", "CEPU", "PAM",
+  "TGS", "CRESY", "BIOX", "EDN", "IRS", "LOMA", "TEO",
 ];
 
+// Yahoo Finance no manda headers CORS para pegarle directo desde
+// el navegador, así que hace falta un proxy. Este es uno público
+// de ejemplo (corsproxy.io) — para producción armá tu propio
+// proxy chiquito (Flask/Node/Cloudflare Worker) que reenvíe la
+// request a query1.finance.yahoo.com, así no dependés de un
+// servicio de terceros y evitás rate limits ajenos.
+const CORS_PROXY = "https://corsproxy.io/?url=";
+// interval=5m + range=1d trae varios puntos intradía reales, en vez
+// de un solo candle diario (que es lo que generaba open == close
+// cuando el meta no traía regularMarketOpen).
+const YAHOO_CHART_URL = (ticker) =>
+  `${CORS_PROXY}${encodeURIComponent(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=5m&range=1d`
+  )}`;
+
 const MAX_PCT_COLOR = 15; // variación % a la que el color llega a su máxima intensidad
-const REFRESH_SECONDS = 300; // 5 minutos, igual que UPDATE_INTERVAL del script
+const REFRESH_SECONDS = 300; // 5 minutos
 
 function pct(value, prev) {
   return ((value - prev) / prev) * 100;
@@ -42,6 +44,86 @@ function deriveCandle(row) {
     lowPct: pct(row.low, row.prevClose),
     closePct,
   };
+}
+
+// Extrae open/high/low/close/prevClose de la respuesta cruda de
+// Yahoo Finance (chart endpoint) para un ticker puntual.
+//
+// Prioridad de las fuentes:
+// 1) Los campos que YA vienen calculados por Yahoo en "meta"
+//    (regularMarketOpen, regularMarketDayHigh, regularMarketDayLow,
+//    regularMarketPrice, chartPreviousClose) — estos los arma Yahoo
+//    con datos de tick completo del día, son más precisos que lo que
+//    podamos reconstruir nosotros con barras de 5 minutos.
+// 2) Si algún campo del meta viene null/ausente (pasa con algunos
+//    tickers), recién ahí se reconstruye a mano a partir de la serie
+//    intradía (indicators.quote), filtrando solo las barras dentro
+//    de meta.currentTradingPeriod.regular para no arrastrar cotizaciones
+//    erráticas de pre-market/after-hours (típico en ADRs poco líquidos).
+function parseYahooChart(ticker, json) {
+  const result = json?.chart?.result?.[0];
+  if (!result) throw new Error(`Sin datos para ${ticker}`);
+
+  const meta = result.meta;
+
+  // Fallback: reconstruir desde las barras intradía, solo sesión regular.
+  const buildFromIntraday = () => {
+    const quote = result.indicators?.quote?.[0] ?? {};
+    const timestamps = result.timestamp ?? [];
+    const regular = meta.currentTradingPeriod?.regular;
+    const inRegularSession = (ts) => !regular || (ts >= regular.start && ts <= regular.end);
+
+    const opens = [];
+    const highs = [];
+    const lows = [];
+    const closes = [];
+    timestamps.forEach((ts, i) => {
+      if (!inRegularSession(ts)) return;
+      if (quote.open?.[i] != null) opens.push(quote.open[i]);
+      if (quote.high?.[i] != null) highs.push(quote.high[i]);
+      if (quote.low?.[i] != null) lows.push(quote.low[i]);
+      if (quote.close?.[i] != null) closes.push(quote.close[i]);
+    });
+    return {
+      open: opens[0],
+      high: highs.length ? Math.max(...highs) : undefined,
+      low: lows.length ? Math.min(...lows) : undefined,
+      close: closes[closes.length - 1],
+    };
+  };
+
+  let fallback = null;
+  const getFallback = () => (fallback ??= buildFromIntraday());
+
+  const prevClose = meta.chartPreviousClose ?? meta.previousClose;
+  const open = meta.regularMarketOpen ?? getFallback().open;
+  const high = meta.regularMarketDayHigh ?? getFallback().high;
+  const low = meta.regularMarketDayLow ?? getFallback().low;
+  const close = meta.regularMarketPrice ?? getFallback().close;
+
+  if ([prevClose, open, high, low, close].some((v) => v == null)) {
+    throw new Error(`Datos incompletos para ${ticker}`);
+  }
+
+  return { ticker, open, high, low, close, prevClose };
+}
+
+async function fetchTicker(ticker) {
+  const res = await fetch(YAHOO_CHART_URL(ticker));
+  if (!res.ok) throw new Error(`HTTP ${res.status} para ${ticker}`);
+  const json = await res.json();
+  return parseYahooChart(ticker, json);
+}
+
+async function fetchAllTickers(tickers) {
+  const settled = await Promise.allSettled(tickers.map(fetchTicker));
+  const rows = [];
+  const failed = [];
+  settled.forEach((r, i) => {
+    if (r.status === "fulfilled") rows.push(r.value);
+    else failed.push(tickers[i]);
+  });
+  return { rows, failed };
 }
 
 function lerp(a, b, t) {
@@ -80,13 +162,16 @@ function fmtPrice(v) {
 }
 
 export default function VelasADR() {
-  const candles = useMemo(() => RAW_DATA.map(deriveCandle), []);
+  const [rawData, setRawData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [failedTickers, setFailedTickers] = useState([]);
 
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState("variacion");
   const [selected, setSelected] = useState(null);
   const [secondsLeft, setSecondsLeft] = useState(REFRESH_SECONDS);
-  const [lastUpdate, setLastUpdate] = useState(new Date());
+  const [lastUpdate, setLastUpdate] = useState(null);
   const [flash, setFlash] = useState(false);
   const reducedMotion = useRef(
     typeof window !== "undefined" && window.matchMedia
@@ -94,20 +179,47 @@ export default function VelasADR() {
       : false
   );
 
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { rows, failed } = await fetchAllTickers(TICKERS);
+      if (rows.length === 0) {
+        throw new Error("No se pudo obtener ningún ticker desde Yahoo Finance.");
+      }
+      setRawData(rows);
+      setFailedTickers(failed);
+      setLastUpdate(new Date());
+      setFlash(true);
+      setTimeout(() => setFlash(false), 900);
+    } catch (e) {
+      setError(e.message || "Error al consultar Yahoo Finance");
+    } finally {
+      setLoading(false);
+      setSecondsLeft(REFRESH_SECONDS);
+    }
+  }, []);
+
+  // Carga inicial
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  // Refresco automático cada REFRESH_SECONDS
   useEffect(() => {
     const id = setInterval(() => {
       setSecondsLeft((s) => {
         if (s <= 1) {
-          setLastUpdate(new Date());
-          setFlash(true);
-          setTimeout(() => setFlash(false), 900);
+          loadData();
           return REFRESH_SECONDS;
         }
         return s - 1;
       });
     }, 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [loadData]);
+
+  const candles = useMemo(() => rawData.map(deriveCandle), [rawData]);
 
   const filtered = useMemo(() => {
     let list = candles.filter((c) => c.ticker.toLowerCase().includes(query.toLowerCase()));
@@ -117,12 +229,19 @@ export default function VelasADR() {
   }, [candles, query, sortBy]);
 
   const maxAbs = useMemo(() => {
+    if (candles.length === 0) return 5;
     const vals = candles.flatMap((c) => [Math.abs(c.highPct), Math.abs(c.lowPct)]);
     return Math.max(...vals, 5) * 1.15;
   }, [candles]);
 
-  const topGainer = useMemo(() => [...candles].sort((a, b) => b.closePct - a.closePct)[0], [candles]);
-  const topLoser = useMemo(() => [...candles].sort((a, b) => a.closePct - b.closePct)[0], [candles]);
+  const topGainer = useMemo(
+    () => (candles.length ? [...candles].sort((a, b) => b.closePct - a.closePct)[0] : null),
+    [candles]
+  );
+  const topLoser = useMemo(
+    () => (candles.length ? [...candles].sort((a, b) => a.closePct - b.closePct)[0] : null),
+    [candles]
+  );
 
   const mm = String(Math.floor(secondsLeft / 60)).padStart(2, "0");
   const ss = String(secondsLeft % 60).padStart(2, "0");
@@ -141,11 +260,14 @@ export default function VelasADR() {
       <style>{`
         @keyframes pulseDot { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
         @keyframes flashRing { 0% { box-shadow: 0 0 0 0 rgba(210,168,87,0.55); } 100% { box-shadow: 0 0 0 10px rgba(210,168,87,0); } }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .live-dot { animation: pulseDot 1.8s ease-in-out infinite; }
         .flash-ring { animation: flashRing 0.9s ease-out; }
+        .spin-icon { animation: spin 1s linear infinite; }
         @media (prefers-reduced-motion: reduce) {
           .live-dot { animation: none; }
           .flash-ring { animation: none; }
+          .spin-icon { animation: none; }
         }
         input::placeholder { color: #5A6684; }
         ::-webkit-scrollbar { height: 8px; }
@@ -159,12 +281,21 @@ export default function VelasADR() {
           <span style={styles.brandRest}>MARKETS</span>
         </div>
         <div style={styles.topBarRight}>
-          <span style={{ ...styles.liveDot, backgroundColor: "#3CE6A0" }} className="live-dot" />
+          <span
+            style={{ ...styles.liveDot, backgroundColor: error ? "#FF5A6E" : "#3CE6A0" }}
+            className={loading ? "" : "live-dot"}
+          />
           <span style={styles.topBarText}>
-            Actualizado {lastUpdate.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+            {loading
+              ? "Actualizando…"
+              : lastUpdate
+              ? `Actualizado ${lastUpdate.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+              : "Sin datos"}
           </span>
           <span style={styles.topBarDivider} />
-          <RefreshCw size={13} color="#7E8CAA" />
+          <button onClick={loadData} style={styles.refreshBtn} title="Actualizar ahora">
+            <RefreshCw size={13} color="#7E8CAA" className={loading ? "spin-icon" : ""} />
+          </button>
           <span style={styles.topBarText}>Próxima en {mm}:{ss}</span>
         </div>
       </div>
@@ -172,177 +303,206 @@ export default function VelasADR() {
       {/* ---- Encabezado ---- */}
       <div style={styles.header}>
         <h1 style={styles.title}>Horizonte diario</h1>
-        <p style={styles.subtitle}>ADRs Argentina — variación vs. cierre anterior (%)</p>
+        <p style={styles.subtitle}>ADRs Argentina — variación vs. cierre anterior (%) · datos de Yahoo Finance</p>
       </div>
 
-      {/* ---- Callouts subida / bajada ---- */}
-      <div style={styles.calloutRow}>
-        <div style={{ ...styles.callout, borderColor: "#1F5A42" }}>
-          <TrendingUp size={16} color="#3CE6A0" />
-          <div>
-            <div style={styles.calloutLabel}>Mayor suba</div>
-            <div style={styles.calloutValue}>
-              <span style={{ fontFamily: "'Space Grotesk', sans-serif" }}>{topGainer.ticker}</span>
-              <span style={{ color: "#3CE6A0", marginLeft: 8 }}>{fmtPct(topGainer.closePct)}</span>
-            </div>
-          </div>
+      {/* ---- Error general ---- */}
+      {error && (
+        <div style={styles.errorBanner}>
+          No se pudo actualizar: {error}. Reintentando en la próxima ventana o tocá el ícono de refresh.
         </div>
-        <div style={{ ...styles.callout, borderColor: "#6E2430" }}>
-          <TrendingDown size={16} color="#FF5A6E" />
-          <div>
-            <div style={styles.calloutLabel}>Mayor baja</div>
-            <div style={styles.calloutValue}>
-              <span style={{ fontFamily: "'Space Grotesk', sans-serif" }}>{topLoser.ticker}</span>
-              <span style={{ color: "#FF5A6E", marginLeft: 8 }}>{fmtPct(topLoser.closePct)}</span>
-            </div>
-          </div>
+      )}
+      {!error && failedTickers.length > 0 && (
+        <div style={styles.warningBanner}>
+          No se pudieron traer: {failedTickers.join(", ")}
         </div>
-      </div>
+      )}
 
-      {/* ---- Controles: buscar + ordenar ---- */}
-      <div style={styles.controls}>
-        <div style={styles.searchBox}>
-          <Search size={15} color="#5A6684" />
-          <input
-            type="text"
-            placeholder="Consultar ticker (ej: GGAL)"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            style={styles.searchInput}
-          />
-          {query && (
-            <X size={14} color="#5A6684" style={{ cursor: "pointer" }} onClick={() => setQuery("")} />
-          )}
+      {/* ---- Loading inicial ---- */}
+      {loading && candles.length === 0 && (
+        <div style={styles.loadingBox}>
+          <Loader2 size={18} className="spin-icon" color="#D2A857" />
+          <span>Consultando Yahoo Finance…</span>
         </div>
-        <div style={styles.sortGroup}>
-          {[
-            { key: "variacion", label: "Variación" },
-            { key: "alfabetico", label: "A-Z" },
-          ].map((opt) => (
-            <button
-              key={opt.key}
-              onClick={() => setSortBy(opt.key)}
-              style={{
-                ...styles.sortBtn,
-                ...(sortBy === opt.key ? styles.sortBtnActive : {}),
-              }}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-      </div>
+      )}
 
-      {/* ---- Gráfico "skyline" de velas ---- */}
-      <div className={flash ? "flash-ring" : ""} style={styles.chartCard}>
-        <div style={styles.chartScroll}>
-          <svg width={chartWidth} height={chartHeight + 40} style={{ display: "block" }}>
-            <line
-              x1={0} x2={chartWidth} y1={midY} y2={midY}
-              stroke="#D2A857" strokeWidth="1" strokeDasharray="2 4" opacity="0.55"
-            />
-            <text x={4} y={midY - 6} fill="#7E8CAA" fontSize="10" fontFamily="'JetBrains Mono', monospace">0%</text>
-
-            {filtered.map((c, i) => {
-              const cx = i * slotWidth + slotWidth / 2;
-              const color = getCandleColor(c.closePct);
-              const isSelected = selected === c.ticker;
-              const bodyTop = yFor(Math.max(c.openPct, c.closePct));
-              const bodyBottomY = yFor(Math.min(c.openPct, c.closePct));
-              let bodyHeight = bodyBottomY - bodyTop;
-              if (bodyHeight < 2) bodyHeight = 2;
-
-              return (
-                <g
-                  key={c.ticker}
-                  onClick={() => setSelected(isSelected ? null : c.ticker)}
-                  style={{ cursor: "pointer" }}
-                  transform={isSelected ? `translate(0,-4)` : undefined}
-                >
-                  <line
-                    x1={cx} x2={cx} y1={yFor(c.highPct)} y2={yFor(c.lowPct)}
-                    stroke={color} strokeWidth={isSelected ? 2.4 : 1.6}
-                  />
-                  <rect
-                    x={cx - bodyWidth / 2} y={bodyTop} width={bodyWidth} height={bodyHeight}
-                    fill={color}
-                    stroke={isSelected ? "#D2A857" : "rgba(0,0,0,0.35)"}
-                    strokeWidth={isSelected ? 1.5 : 1}
-                    rx="2"
-                  />
-                  <text
-                    x={cx} y={chartHeight + 20} textAnchor="middle"
-                    fill={isSelected ? "#EAF0FA" : "#7E8CAA"}
-                    fontSize="11" fontFamily="'JetBrains Mono', monospace"
-                    fontWeight={isSelected ? "700" : "400"}
-                  >
-                    {c.ticker}
-                  </text>
-                  <text
-                    x={cx} y={chartHeight + 33} textAnchor="middle"
-                    fill={color} fontSize="10" fontFamily="'JetBrains Mono', monospace"
-                  >
-                    {fmtPct(c.closePct)}
-                  </text>
-                </g>
-              );
-            })}
-          </svg>
-        </div>
-        {filtered.length === 0 && (
-          <div style={styles.emptyState}>Ningún ticker coincide con "{query}"</div>
-        )}
-      </div>
-
-      {/* ---- Panel de detalle ---- */}
-      {selected && (() => {
-        const c = candles.find((x) => x.ticker === selected);
-        const color = getCandleColor(c.closePct);
-        return (
-          <div style={styles.detailPanel}>
-            <div style={styles.detailHeader}>
-              <div style={styles.detailTicker}>
-                <span style={{ width: 10, height: 10, borderRadius: 3, background: color, display: "inline-block" }} />
-                {c.ticker}
+      {candles.length > 0 && (
+        <>
+          {/* ---- Callouts subida / bajada ---- */}
+          <div style={styles.calloutRow}>
+            {topGainer && (
+              <div style={{ ...styles.callout, borderColor: "#1F5A42" }}>
+                <TrendingUp size={16} color="#3CE6A0" />
+                <div>
+                  <div style={styles.calloutLabel}>Mayor suba</div>
+                  <div style={styles.calloutValue}>
+                    <span style={{ fontFamily: "'Space Grotesk', sans-serif" }}>{topGainer.ticker}</span>
+                    <span style={{ color: "#3CE6A0", marginLeft: 8 }}>{fmtPct(topGainer.closePct)}</span>
+                  </div>
+                </div>
               </div>
-              <X size={16} color="#7E8CAA" style={{ cursor: "pointer" }} onClick={() => setSelected(null)} />
-            </div>
-            <div style={styles.detailGrid}>
-              <DetailField label="Apertura" value={fmtPrice(c.open)} sub={fmtPct(c.openPct)} />
-              <DetailField label="Máximo" value={fmtPrice(c.high)} sub={fmtPct(c.highPct)} />
-              <DetailField label="Mínimo" value={fmtPrice(c.low)} sub={fmtPct(c.lowPct)} />
-              <DetailField label="Cierre" value={fmtPrice(c.close)} sub={fmtPct(c.closePct)} highlight />
-            </div>
-            <div style={styles.detailFooter}>Cierre anterior: {fmtPrice(c.prevClose)} USD</div>
+            )}
+            {topLoser && (
+              <div style={{ ...styles.callout, borderColor: "#6E2430" }}>
+                <TrendingDown size={16} color="#FF5A6E" />
+                <div>
+                  <div style={styles.calloutLabel}>Mayor baja</div>
+                  <div style={styles.calloutValue}>
+                    <span style={{ fontFamily: "'Space Grotesk', sans-serif" }}>{topLoser.ticker}</span>
+                    <span style={{ color: "#FF5A6E", marginLeft: 8 }}>{fmtPct(topLoser.closePct)}</span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
-        );
-      })()}
 
-      {/* ---- Ranking ---- */}
-      <div style={styles.rankSection}>
-        <div style={styles.rankTitle}>Ranking del día</div>
-        <div style={styles.rankList}>
-          {[...candles].sort((a, b) => b.closePct - a.closePct).map((c) => {
+          {/* ---- Controles: buscar + ordenar ---- */}
+          <div style={styles.controls}>
+            <div style={styles.searchBox}>
+              <Search size={15} color="#5A6684" />
+              <input
+                type="text"
+                placeholder="Consultar ticker (ej: GGAL)"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                style={styles.searchInput}
+              />
+              {query && (
+                <X size={14} color="#5A6684" style={{ cursor: "pointer" }} onClick={() => setQuery("")} />
+              )}
+            </div>
+            <div style={styles.sortGroup}>
+              {[
+                { key: "variacion", label: "Variación" },
+                { key: "alfabetico", label: "A-Z" },
+              ].map((opt) => (
+                <button
+                  key={opt.key}
+                  onClick={() => setSortBy(opt.key)}
+                  style={{
+                    ...styles.sortBtn,
+                    ...(sortBy === opt.key ? styles.sortBtnActive : {}),
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* ---- Gráfico "skyline" de velas ---- */}
+          <div className={flash ? "flash-ring" : ""} style={styles.chartCard}>
+            <div style={styles.chartScroll}>
+              <svg width={chartWidth} height={chartHeight + 40} style={{ display: "block" }}>
+                <line
+                  x1={0} x2={chartWidth} y1={midY} y2={midY}
+                  stroke="#D2A857" strokeWidth="1" strokeDasharray="2 4" opacity="0.55"
+                />
+                <text x={4} y={midY - 6} fill="#7E8CAA" fontSize="10" fontFamily="'JetBrains Mono', monospace">0%</text>
+
+                {filtered.map((c, i) => {
+                  const cx = i * slotWidth + slotWidth / 2;
+                  const color = getCandleColor(c.closePct);
+                  const isSelected = selected === c.ticker;
+                  const bodyTop = yFor(Math.max(c.openPct, c.closePct));
+                  const bodyBottomY = yFor(Math.min(c.openPct, c.closePct));
+                  let bodyHeight = bodyBottomY - bodyTop;
+                  if (bodyHeight < 2) bodyHeight = 2;
+
+                  return (
+                    <g
+                      key={c.ticker}
+                      onClick={() => setSelected(isSelected ? null : c.ticker)}
+                      style={{ cursor: "pointer" }}
+                      transform={isSelected ? `translate(0,-4)` : undefined}
+                    >
+                      <line
+                        x1={cx} x2={cx} y1={yFor(c.highPct)} y2={yFor(c.lowPct)}
+                        stroke={color} strokeWidth={isSelected ? 2.4 : 1.6}
+                      />
+                      <rect
+                        x={cx - bodyWidth / 2} y={bodyTop} width={bodyWidth} height={bodyHeight}
+                        fill={color}
+                        stroke={isSelected ? "#D2A857" : "rgba(0,0,0,0.35)"}
+                        strokeWidth={isSelected ? 1.5 : 1}
+                        rx="2"
+                      />
+                      <text
+                        x={cx} y={chartHeight + 20} textAnchor="middle"
+                        fill={isSelected ? "#EAF0FA" : "#7E8CAA"}
+                        fontSize="11" fontFamily="'JetBrains Mono', monospace"
+                        fontWeight={isSelected ? "700" : "400"}
+                      >
+                        {c.ticker}
+                      </text>
+                      <text
+                        x={cx} y={chartHeight + 33} textAnchor="middle"
+                        fill={color} fontSize="10" fontFamily="'JetBrains Mono', monospace"
+                      >
+                        {fmtPct(c.closePct)}
+                      </text>
+                    </g>
+                  );
+                })}
+              </svg>
+            </div>
+            {filtered.length === 0 && (
+              <div style={styles.emptyState}>Ningún ticker coincide con "{query}"</div>
+            )}
+          </div>
+
+          {/* ---- Panel de detalle ---- */}
+          {selected && (() => {
+            const c = candles.find((x) => x.ticker === selected);
+            if (!c) return null;
             const color = getCandleColor(c.closePct);
-            const up = c.closePct >= 0;
             return (
-              <div
-                key={c.ticker}
-                style={{
-                  ...styles.rankRow,
-                  ...(selected === c.ticker ? styles.rankRowActive : {}),
-                }}
-                onClick={() => setSelected(selected === c.ticker ? null : c.ticker)}
-              >
-                <span style={styles.rankTicker}>{c.ticker}</span>
-                <span style={{ flex: 1 }} />
-                {up ? <ArrowUp size={13} color={color} /> : <ArrowDown size={13} color={color} />}
-                <span style={{ ...styles.rankPct, color }}>{fmtPct(c.closePct)}</span>
+              <div style={styles.detailPanel}>
+                <div style={styles.detailHeader}>
+                  <div style={styles.detailTicker}>
+                    <span style={{ width: 10, height: 10, borderRadius: 3, background: color, display: "inline-block" }} />
+                    {c.ticker}
+                  </div>
+                  <X size={16} color="#7E8CAA" style={{ cursor: "pointer" }} onClick={() => setSelected(null)} />
+                </div>
+                <div style={styles.detailGrid}>
+                  <DetailField label="Apertura" value={fmtPrice(c.open)} sub={fmtPct(c.openPct)} />
+                  <DetailField label="Máximo" value={fmtPrice(c.high)} sub={fmtPct(c.highPct)} />
+                  <DetailField label="Mínimo" value={fmtPrice(c.low)} sub={fmtPct(c.lowPct)} />
+                  <DetailField label="Cierre" value={fmtPrice(c.close)} sub={fmtPct(c.closePct)} highlight />
+                </div>
+                <div style={styles.detailFooter}>Cierre anterior: {fmtPrice(c.prevClose)} USD</div>
               </div>
             );
-          })}
-        </div>
-      </div>
+          })()}
+
+          {/* ---- Ranking ---- */}
+          <div style={styles.rankSection}>
+            <div style={styles.rankTitle}>Ranking del día</div>
+            <div style={styles.rankList}>
+              {[...candles].sort((a, b) => b.closePct - a.closePct).map((c) => {
+                const color = getCandleColor(c.closePct);
+                const up = c.closePct >= 0;
+                return (
+                  <div
+                    key={c.ticker}
+                    style={{
+                      ...styles.rankRow,
+                      ...(selected === c.ticker ? styles.rankRowActive : {}),
+                    }}
+                    onClick={() => setSelected(selected === c.ticker ? null : c.ticker)}
+                  >
+                    <span style={styles.rankTicker}>{c.ticker}</span>
+                    <span style={{ flex: 1 }} />
+                    {up ? <ArrowUp size={13} color={color} /> : <ArrowDown size={13} color={color} />}
+                    <span style={{ ...styles.rankPct, color }}>{fmtPct(c.closePct)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
 
       <div style={styles.watermark}>@MJPmarkets</div>
     </div>
@@ -384,9 +544,25 @@ const styles = {
   liveDot: { width: 7, height: 7, borderRadius: "50%", display: "inline-block" },
   topBarText: { fontSize: 12, color: "#7E8CAA", fontFamily: "'JetBrains Mono', monospace" },
   topBarDivider: { width: 1, height: 12, background: "#22304A", margin: "0 2px" },
+  refreshBtn: {
+    background: "transparent", border: "none", cursor: "pointer",
+    display: "flex", alignItems: "center", padding: 2,
+  },
   header: { marginTop: 24, marginBottom: 4 },
   title: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, fontWeight: 700, margin: 0, letterSpacing: -0.5 },
   subtitle: { color: "#7E8CAA", fontSize: 13, marginTop: 4 },
+  errorBanner: {
+    marginTop: 16, background: "#3B1620", border: "1px solid #6E2430",
+    color: "#FF9AA8", fontSize: 12.5, borderRadius: 8, padding: "10px 14px",
+  },
+  warningBanner: {
+    marginTop: 16, background: "#241C0E", border: "1px solid #6E5424",
+    color: "#E8C77F", fontSize: 12.5, borderRadius: 8, padding: "10px 14px",
+  },
+  loadingBox: {
+    marginTop: 24, display: "flex", alignItems: "center", gap: 10,
+    color: "#7E8CAA", fontSize: 13, fontFamily: "'JetBrains Mono', monospace",
+  },
   calloutRow: { display: "flex", gap: 12, marginTop: 20, flexWrap: "wrap" },
   callout: {
     flex: "1 1 200px",
