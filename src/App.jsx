@@ -1,164 +1,88 @@
-import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { Search, RefreshCw, ArrowUp, ArrowDown, X, TrendingUp, TrendingDown, Loader2 } from "lucide-react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  RefreshCw,
+  Loader2,
+  TrendingUp,
+  TrendingDown,
+  Search,
+  X,
+  ArrowUp,
+  ArrowDown,
+} from "lucide-react";
 
-// ============================================================= //
-// TICKERS A CONSULTAR
-// Antes esto era un array de objetos hardcodeado (RAW_DATA).
-// Ahora solo guardamos la lista de tickers y el resto de los
-// datos (open/high/low/close/prevClose) se pide en vivo a la
-// API de Yahoo Finance (endpoint "chart").
-// ============================================================= //
 const TICKERS = [
   "GGAL", "BMA", "YPF", "MELI", "SUPV", "CEPU", "PAM",
   "TGS", "CRESY", "BIOX", "EDN", "IRS", "LOMA", "TEO",
 ];
 
-// Yahoo Finance no manda headers CORS para pegarle directo desde
-// el navegador, así que hace falta un proxy. Este es uno público
-// de ejemplo (corsproxy.io) — para producción armá tu propio
-// proxy chiquito (Flask/Node/Cloudflare Worker) que reenvíe la
-// request a query1.finance.yahoo.com, así no dependés de un
-// servicio de terceros y evitás rate limits ajenos.
-const CORS_PROXY = "https://corsproxy.io/?url=";
-// interval=5m + range=1d trae varios puntos intradía reales, en vez
-// de un solo candle diario (que es lo que generaba open == close
-// cuando el meta no traía regularMarketOpen).
-const YAHOO_CHART_URL = (ticker) =>
-  `${CORS_PROXY}${encodeURIComponent(
-    `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=5m&range=1d`
-  )}`;
+const REFRESH_SECONDS = 60;
 
-const MAX_PCT_COLOR = 15; // variación % a la que el color llega a su máxima intensidad
-const REFRESH_SECONDS = 300; // 5 minutos
+// ---- Fetch a nuestro backend (/api/adrs) ----
+// Espera un JSON tipo:
+// [{ ticker, open, high, low, close, prevClose }, ...]
+async function fetchAllTickers() {
+  const res = await fetch("/api/adrs", { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(`El servidor respondió ${res.status}`);
+  }
+  const data = await res.json();
 
-function pct(value, prev) {
-  return ((value - prev) / prev) * 100;
-}
-
-function deriveCandle(row) {
-  const closePct = pct(row.close, row.prevClose);
-  return {
-    ...row,
-    openPct: pct(row.open, row.prevClose),
-    highPct: pct(row.high, row.prevClose),
-    lowPct: pct(row.low, row.prevClose),
-    closePct,
-  };
-}
-
-// Extrae open/high/low/close/prevClose de la respuesta cruda de
-// Yahoo Finance (chart endpoint) para un ticker puntual.
-//
-// Prioridad de las fuentes:
-// 1) Los campos que YA vienen calculados por Yahoo en "meta"
-//    (regularMarketOpen, regularMarketDayHigh, regularMarketDayLow,
-//    regularMarketPrice, chartPreviousClose) — estos los arma Yahoo
-//    con datos de tick completo del día, son más precisos que lo que
-//    podamos reconstruir nosotros con barras de 5 minutos.
-// 2) Si algún campo del meta viene null/ausente (pasa con algunos
-//    tickers), recién ahí se reconstruye a mano a partir de la serie
-//    intradía (indicators.quote), filtrando solo las barras dentro
-//    de meta.currentTradingPeriod.regular para no arrastrar cotizaciones
-//    erráticas de pre-market/after-hours (típico en ADRs poco líquidos).
-function parseYahooChart(ticker, json) {
-  const result = json?.chart?.result?.[0];
-  if (!result) throw new Error(`Sin datos para ${ticker}`);
-
-  const meta = result.meta;
-
-  // Fallback: reconstruir desde las barras intradía, solo sesión regular.
-  const buildFromIntraday = () => {
-    const quote = result.indicators?.quote?.[0] ?? {};
-    const timestamps = result.timestamp ?? [];
-    const regular = meta.currentTradingPeriod?.regular;
-    const inRegularSession = (ts) => !regular || (ts >= regular.start && ts <= regular.end);
-
-    const opens = [];
-    const highs = [];
-    const lows = [];
-    const closes = [];
-    timestamps.forEach((ts, i) => {
-      if (!inRegularSession(ts)) return;
-      if (quote.open?.[i] != null) opens.push(quote.open[i]);
-      if (quote.high?.[i] != null) highs.push(quote.high[i]);
-      if (quote.low?.[i] != null) lows.push(quote.low[i]);
-      if (quote.close?.[i] != null) closes.push(quote.close[i]);
-    });
-    return {
-      open: opens[0],
-      high: highs.length ? Math.max(...highs) : undefined,
-      low: lows.length ? Math.min(...lows) : undefined,
-      close: closes[closes.length - 1],
-    };
-  };
-
-  let fallback = null;
-  const getFallback = () => (fallback ??= buildFromIntraday());
-
-  const prevClose = meta.chartPreviousClose ?? meta.previousClose;
-  const open = meta.regularMarketOpen ?? getFallback().open;
-  const high = meta.regularMarketDayHigh ?? getFallback().high;
-  const low = meta.regularMarketDayLow ?? getFallback().low;
-  const close = meta.regularMarketPrice ?? getFallback().close;
-
-  if ([prevClose, open, high, low, close].some((v) => v == null)) {
-    throw new Error(`Datos incompletos para ${ticker}`);
+  if (!Array.isArray(data)) {
+    throw new Error("Respuesta inesperada de /api/adrs");
   }
 
-  return { ticker, open, high, low, close, prevClose };
-}
-
-async function fetchTicker(ticker) {
-  const res = await fetch(YAHOO_CHART_URL(ticker));
-  if (!res.ok) throw new Error(`HTTP ${res.status} para ${ticker}`);
-  const json = await res.json();
-  return parseYahooChart(ticker, json);
-}
-
-async function fetchAllTickers(tickers) {
-  const settled = await Promise.allSettled(tickers.map(fetchTicker));
+  const byTicker = new Map(data.map((d) => [d.ticker, d]));
   const rows = [];
   const failed = [];
-  settled.forEach((r, i) => {
-    if (r.status === "fulfilled") rows.push(r.value);
-    else failed.push(tickers[i]);
-  });
+
+  for (const t of TICKERS) {
+    const row = byTicker.get(t);
+    if (
+      row &&
+      Number.isFinite(row.open) &&
+      Number.isFinite(row.high) &&
+      Number.isFinite(row.low) &&
+      Number.isFinite(row.close) &&
+      Number.isFinite(row.prevClose)
+    ) {
+      rows.push(row);
+    } else {
+      failed.push(t);
+    }
+  }
+
   return { rows, failed };
 }
 
-function lerp(a, b, t) {
-  return Math.round(a + (b - a) * t);
-}
-
-function hexToRgb(hex) {
-  const n = parseInt(hex.slice(1), 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-function interpolateColor(hexA, hexB, t) {
-  const a = hexToRgb(hexA);
-  const b = hexToRgb(hexB);
-  const r = lerp(a[0], b[0], t);
-  const g = lerp(a[1], b[1], t);
-  const bl = lerp(a[2], b[2], t);
-  return `rgb(${r},${g},${bl})`;
-}
-
-function getCandleColor(closePct) {
-  if (closePct == null || Number.isNaN(closePct)) return "#566178";
-  const intensity = Math.min(Math.abs(closePct) / MAX_PCT_COLOR, 1);
-  if (closePct > 0) return interpolateColor("#123527", "#3CE6A0", intensity);
-  if (closePct < 0) return interpolateColor("#3B1620", "#FF5A6E", intensity);
-  return "#566178";
+// ---- Deriva porcentajes respecto al cierre anterior ----
+function deriveCandle(row) {
+  const { ticker, open, high, low, close, prevClose } = row;
+  const pct = (v) => (prevClose ? ((v - prevClose) / prevClose) * 100 : 0);
+  return {
+    ticker,
+    open,
+    high,
+    low,
+    close,
+    prevClose,
+    openPct: pct(open),
+    highPct: pct(high),
+    lowPct: pct(low),
+    closePct: pct(close),
+  };
 }
 
 function fmtPct(v) {
-  const s = v.toFixed(2);
-  return (v > 0 ? "+" : "") + s + "%";
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v.toFixed(2)}%`;
 }
 
 function fmtPrice(v) {
-  return v.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+}
+
+function getCandleColor(closePct) {
+  return closePct >= 0 ? "#3CE6A0" : "#FF5A6E";
 }
 
 export default function VelasADR() {
@@ -183,9 +107,9 @@ export default function VelasADR() {
     setLoading(true);
     setError(null);
     try {
-      const { rows, failed } = await fetchAllTickers(TICKERS);
+      const { rows, failed } = await fetchAllTickers();
       if (rows.length === 0) {
-        throw new Error("No se pudo obtener ningún ticker desde Yahoo Finance.");
+        throw new Error("No se pudo obtener ningún ticker desde /api/adrs.");
       }
       setRawData(rows);
       setFailedTickers(failed);
@@ -193,7 +117,7 @@ export default function VelasADR() {
       setFlash(true);
       setTimeout(() => setFlash(false), 900);
     } catch (e) {
-      setError(e.message || "Error al consultar Yahoo Finance");
+      setError(e.message || "Error al consultar /api/adrs");
     } finally {
       setLoading(false);
       setSecondsLeft(REFRESH_SECONDS);
@@ -303,7 +227,7 @@ export default function VelasADR() {
       {/* ---- Encabezado ---- */}
       <div style={styles.header}>
         <h1 style={styles.title}>Horizonte diario</h1>
-        <p style={styles.subtitle}>ADRs Argentina — variación vs. cierre anterior (%) · datos de Yahoo Finance</p>
+        <p style={styles.subtitle}>ADRs Argentina — variación vs. cierre anterior (%) · datos de /api/adrs</p>
       </div>
 
       {/* ---- Error general ---- */}
@@ -322,7 +246,7 @@ export default function VelasADR() {
       {loading && candles.length === 0 && (
         <div style={styles.loadingBox}>
           <Loader2 size={18} className="spin-icon" color="#D2A857" />
-          <span>Consultando Yahoo Finance…</span>
+          <span>Consultando /api/adrs…</span>
         </div>
       )}
 
