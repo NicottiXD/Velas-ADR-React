@@ -94,7 +94,7 @@ export default function VelasADR() {
     setError(null);
 
     try {
-      const res = await fetch("http://localhost:3000/api/adrs");
+      const res = await fetch("/api/adrs");
       if (!res.ok) throw new Error("Error en /api/adrs");
 
       const data = await res.json();
