@@ -227,7 +227,7 @@ export default function VelasADR() {
       {/* ---- Encabezado ---- */}
       <div style={styles.header}>
         <h1 style={styles.title}>Horizonte diario</h1>
-        <p style={styles.subtitle}>ADRs Argentina — variación vs. cierre anterior (%) · datos de /api/adrs</p>
+        <p style={styles.subtitle}>ADRs Argentina — variación vs. cierre anterior (%)</p>
       </div>
 
       {/* ---- Error general ---- */}
