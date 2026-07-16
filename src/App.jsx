@@ -94,6 +94,8 @@ export default function VelasADR() {
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState("variacion");
   const [selected, setSelected] = useState(null);
+  const [intraday, setIntraday] = useState(null);
+  const [intradayLoading, setIntradayLoading] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState(REFRESH_SECONDS);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [flash, setFlash] = useState(false);
@@ -142,6 +144,30 @@ export default function VelasADR() {
     }, 1000);
     return () => clearInterval(id);
   }, [loadData]);
+
+  // Trae el gráfico intradiario cuando se selecciona un ticker
+  useEffect(() => {
+    if (!selected) {
+      setIntraday(null);
+      return;
+    }
+    let cancelled = false;
+    setIntradayLoading(true);
+    fetch(`/api/intraday?ticker=${selected}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!cancelled) setIntraday(data);
+      })
+      .catch(() => {
+        if (!cancelled) setIntraday(null);
+      })
+      .finally(() => {
+        if (!cancelled) setIntradayLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
 
   const candles = useMemo(() => rawData.map(deriveCandle), [rawData]);
 
@@ -396,6 +422,21 @@ export default function VelasADR() {
                   <DetailField label="Cierre" value={fmtPrice(c.close)} sub={fmtPct(c.closePct)} highlight />
                 </div>
                 <div style={styles.detailFooter}>Cierre anterior: {fmtPrice(c.prevClose)} USD</div>
+
+                <div style={styles.intradayBox}>
+                  {intradayLoading && (
+                    <div style={styles.intradayLoading}>
+                      <Loader2 size={14} className="spin-icon" color="#D2A857" />
+                      <span>Cargando gráfico intradiario…</span>
+                    </div>
+                  )}
+                  {!intradayLoading && intraday && intraday.points?.length > 0 && (
+                    <IntradayChart points={intraday.points} prevClose={intraday.prevClose ?? c.prevClose} />
+                  )}
+                  {!intradayLoading && (!intraday || !intraday.points?.length) && (
+                    <div style={styles.intradayEmpty}>Sin datos intradiarios disponibles.</div>
+                  )}
+                </div>
               </div>
             );
           })()}
@@ -430,6 +471,124 @@ export default function VelasADR() {
 
       <div style={styles.watermark}>@MJPmarkets</div>
     </div>
+  );
+}
+
+function IntradayChart({ points, prevClose }) {
+  const width = 640;
+  const height = 200;
+  const padding = 28;
+  const svgRef = useRef(null);
+  const [hoverIndex, setHoverIndex] = useState(null);
+
+  const prices = points.map((p) => p.price);
+  const min = Math.min(...prices, prevClose);
+  const max = Math.max(...prices, prevClose);
+  const range = max - min || 1;
+
+  const x = (i) => padding + (i / (points.length - 1)) * (width - padding * 2);
+  const y = (price) =>
+    height - padding - ((price - min) / range) * (height - padding * 2);
+
+  const linePath = points
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(p.price)}`)
+    .join(" ");
+
+  const lastPrice = points[points.length - 1].price;
+  const color = lastPrice >= prevClose ? "#3CE6A0" : "#FF5A6E";
+
+  const areaPath = `${linePath} L ${x(points.length - 1)} ${height - padding} L ${x(0)} ${height - padding} Z`;
+
+  const handleMove = (e) => {
+    if (!svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const relX = ((e.clientX - rect.left) / rect.width) * width;
+    // punto más cercano en X
+    let closest = 0;
+    let closestDist = Infinity;
+    for (let i = 0; i < points.length; i++) {
+      const d = Math.abs(x(i) - relX);
+      if (d < closestDist) {
+        closestDist = d;
+        closest = i;
+      }
+    }
+    setHoverIndex(closest);
+  };
+
+  const handleLeave = () => setHoverIndex(null);
+
+  const hovered = hoverIndex != null ? points[hoverIndex] : null;
+  const hoverColor = hovered && hovered.price >= prevClose ? "#3CE6A0" : "#FF5A6E";
+
+  // ubica el tooltip a izquierda o derecha del cursor según haya lugar
+  const tooltipWidth = 108;
+  const tooltipOnRight = hovered ? x(hoverIndex) < width - padding - tooltipWidth - 6 : true;
+  const tooltipX = hovered
+    ? tooltipOnRight
+      ? x(hoverIndex) + 8
+      : x(hoverIndex) - tooltipWidth - 8
+    : 0;
+
+  return (
+    <svg
+      ref={svgRef}
+      viewBox={`0 0 ${width} ${height}`}
+      width="100%"
+      style={{ display: "block", cursor: "crosshair" }}
+      onMouseMove={handleMove}
+      onMouseLeave={handleLeave}
+    >
+      <path d={areaPath} fill={color} opacity="0.12" />
+      <path d={linePath} fill="none" stroke={color} strokeWidth="1.8" />
+      <line
+        x1={padding} x2={width - padding}
+        y1={y(prevClose)} y2={y(prevClose)}
+        stroke="#5A6684" strokeDasharray="3 3"
+      />
+      <text
+        x={width - padding} y={y(prevClose) - 4}
+        fill="#7E8CAA" fontSize="10" fontFamily="'JetBrains Mono', monospace"
+        textAnchor="end"
+      >
+        Cierre ant. {fmtPrice(prevClose)}
+      </text>
+
+      {hovered && (
+        <>
+          {/* línea vertical de la cruz */}
+          <line
+            x1={x(hoverIndex)} x2={x(hoverIndex)}
+            y1={padding} y2={height - padding}
+            stroke="#7E8CAA" strokeWidth="1" strokeDasharray="3 3"
+          />
+          {/* línea horizontal de la cruz */}
+          <line
+            x1={padding} x2={width - padding}
+            y1={y(hovered.price)} y2={y(hovered.price)}
+            stroke="#7E8CAA" strokeWidth="1" strokeDasharray="3 3"
+          />
+          {/* punto marcado */}
+          <circle
+            cx={x(hoverIndex)} cy={y(hovered.price)}
+            r="3.5" fill={hoverColor} stroke="#0B1220" strokeWidth="1.5"
+          />
+          {/* tooltip */}
+          <g transform={`translate(${tooltipX}, ${padding})`}>
+            <rect
+              width={tooltipWidth} height={34} rx="5"
+              fill="#0F1626" stroke="#22304A"
+            />
+            <text x={8} y={14} fill="#EAF0FA" fontSize="11" fontFamily="'JetBrains Mono', monospace" fontWeight="700">
+              {fmtPrice(hovered.price)}
+            </text>
+            <text x={8} y={27} fill="#7E8CAA" fontSize="9.5" fontFamily="'JetBrains Mono', monospace">
+              {new Date(hovered.time).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" })}
+            </text>
+          </g>
+        </>
+      )}
+    </svg>
   );
 }
 
@@ -536,6 +695,12 @@ const styles = {
   detailValue: { fontSize: 15, fontFamily: "'JetBrains Mono', monospace", color: "#C6CEE0", marginTop: 2 },
   detailSub: { fontSize: 11, fontFamily: "'JetBrains Mono', monospace", color: "#5A6684", marginTop: 2 },
   detailFooter: { marginTop: 12, fontSize: 11, color: "#5A6684", borderTop: "1px solid #22304A", paddingTop: 10 },
+  intradayBox: { marginTop: 14 },
+  intradayLoading: {
+    display: "flex", alignItems: "center", gap: 8,
+    color: "#7E8CAA", fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
+  },
+  intradayEmpty: { color: "#5A6684", fontSize: 12 },
   rankSection: { marginTop: 28 },
   rankTitle: { fontSize: 13, color: "#7E8CAA", marginBottom: 10, letterSpacing: 0.5 },
   rankList: { display: "flex", flexDirection: "column", gap: 1, border: "1px solid #1A2740", borderRadius: 10, overflow: "hidden" },
